@@ -23,5 +23,5 @@ fn main() {
         .with_config(config)
         .generate()
         .expect("Unable to generate C bindings")
-        .write_to_file("libreplc.h");
+        .write_to_file("../../libreplc.h");
 }

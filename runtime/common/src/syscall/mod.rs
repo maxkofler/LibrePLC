@@ -1,7 +1,7 @@
 //! System calls that allow PLC modules to interact
 //! with the host runtime in the setup phase
 
-use std::ffi::c_void;
+use core::ffi::c_void;
 
 /// All the available system calls
 #[repr(u16)]
@@ -13,11 +13,6 @@ pub enum Syscall {
 
 /// The system call handler function
 pub extern "C" fn syscall_function(context: usize, syscall: Syscall, arg: *mut c_void) -> usize {
-    println!(
-        "syscall(context={context:x?}, syscall={syscall:?}, arg={:x})",
-        arg as usize
-    );
-
     match syscall {
         Syscall::Nop => 0,
     }
