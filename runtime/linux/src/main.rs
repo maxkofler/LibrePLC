@@ -4,6 +4,11 @@ use common::syscall;
 use libloading::{Library, Symbol};
 
 fn main() {
+    if std::env::var("RUST_LOG").is_err() {
+        unsafe { std::env::set_var("RUST_LOG", "trace") };
+    }
+    pretty_env_logger::init();
+
     let args: Vec<String> = args().collect();
 
     unsafe {
