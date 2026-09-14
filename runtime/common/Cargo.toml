@@ -3,7 +3,12 @@ name = "common"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Enable logging through the 'log' framework
+logging_log = ["dep:log"]
+
 [dependencies]
+log = { version = "0.4.29", optional = true }
 
 [build-dependencies]
 cbindgen = "0.29.4"
