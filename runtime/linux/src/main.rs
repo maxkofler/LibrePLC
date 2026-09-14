@@ -19,7 +19,7 @@ fn main() {
                 usize,
                 extern "C" fn(usize, syscall::Syscall, *mut c_void) -> usize,
             ) -> u32,
-        > = lib.get(b"setup").unwrap();
+        > = lib.get(b"__lplc_setup").unwrap();
 
         let v = f_setup(0xDEADBEEF, syscall::syscall_function);
 
