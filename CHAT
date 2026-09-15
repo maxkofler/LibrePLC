@@ -1,0 +1,504 @@
+ Linux: I have a program that loads another program. The loaded program should be able to call functionality from the loading program and the loading program sends periodic time-critical signals to the loaded program.
+
+What mechanisms should I use for this?
+
+Your design choice depends on whether the loaded program runs in the same process memory space (plugin model) or as a separate process (isolated process model).
+
+Option 1: In-Process Architecture (Plugin Model)
+
+Use this when you need sub-microsecond latency and high-frequency communication.
+
+    Calling Host Functionality: The host loads the dynamic library using dlopen(). Pass a context struct containing host function pointers to the loaded library during its initialization function. Alternatively, build the host with the -rdynamic linker flag so the dynamic library can resolve exported host symbols via dlsym(RTLD_DEFAULT, "symbol_name").
+
+    Time-Critical Signals:
+
+        Direct Callbacks: Drive timing using a dedicated host thread running a high-resolution timer (timerfd with CLOCK_MONOTONIC) that calls a callback exported by the plugin.
+
+        Lock-Free Ring Buffers: For transferring data alongside time ticks without lock contention, use a Single-Producer Single-Consumer (SPSC) ring buffer in shared heap memory.
+
+Option 2: Multi-Process Architecture (Isolated Model)
+
+Use this if the loaded program must be isolated so a crash in the child process does not bring down the main host process.
+
+    Calling Host Functionality:
+
+        Unix Domain Sockets (AF_UNIX): Best for bidirectional command/response function invocation with minimal overhead (~2–5 microseconds).
+
+        Shared Memory (shm_open + mmap): Best for high-throughput zero-copy data sharing between host and child.
+
+    Time-Critical Signals:
+
+        eventfd: A lightweight kernel event counter mechanism that can be polled or read like a file descriptor. It integrates cleanly with epoll loops.
+
+        POSIX Real-Time Signals (SIGRTMIN to SIGRTMAX): Unlike standard Linux signals, real-time signals are queued (so signals aren't lost if fired rapidly) and can carry a small data payload using sigqueue().
+
+        Futexes: Shared-memory locks/events that operate entirely in user space unless a process actually needs to sleep, providing the lowest-latency IPC signal.
+
+Mechanism	Host Calling Method	Signaling Method	Latency	Crash Resilience
+In-Process (dlopen)	Function Pointers / dlsym	Direct Callback / timerfd	Sub-microsecond	Low (Child crash kills Host)
+Multi-Process (IPC)	Unix Sockets / Shared Memory	eventfd / Real-Time Signals	~1–5 microseconds	High
+Would you like a minimal C/C++ code prototype for either the dynamic library approach or the IPC approach?
+Ja
+
+I would like to isolate the loaded program (The program is actually a shim that then loads the DLL itself) for crash resistance and security. The calls from the loaded program to the host are not time critical, but the signals from the host to the loaded program are. The host to loaded signals also do not need any payload, as that is done through shared memory
+
+For a multi-process architecture with process isolation, shared-memory data transport, time-critical host-to-child signaling, and non-time-critical child-to-host calls, the optimal Linux stack uses memfd_create, eventfd (or shared futexes), and Unix Domain Sockets.
+Recommended Architecture Components
+1. Host-to-Child Time-Critical Signaling
+
+Since data is transferred via shared memory, the signal only needs to notify the child that new data is available or a timer tick occurred.
+
+    eventfd (Recommended):
+
+        How it works: A lightweight, kernel-backed 8-byte event counter file descriptor.
+
+        Performance: Very low overhead (~1 microsecond latency). The host triggers a signal with a single 8-byte write(), and the child process unblocks with a read() or monitors it via an epoll event loop.
+
+        Setup: The host creates the eventfd instance and passes the descriptor to the child process via file descriptor inheritance (fork/exec) or over a socket using SCM_RIGHTS.
+
+    Shared Futex / Shared Condition Variable (Lowest Latency Alternative):
+
+        How it works: A pthread_cond_t initialized with the PTHREAD_PROCESS_SHARED attribute placed inside the shared memory region.
+
+        Performance: Sub-microsecond latency. Atomically checked in user space; only triggers a system call (sys_futex) when the child is actively sleeping and needs to be woken up.
+
+2. Data Payload (Shared Memory)
+
+    memfd_create + mmap:
+
+        How it works: Creates an anonymous file in RAM without creating a path on the filesystem (unlike traditional /dev/shm POSIX shared memory).
+
+        Benefits: Highly secure—no other process on the system can discover or access the memory region unless handed the file descriptor.
+
+3. Child-to-Host Function Calls (Non-Time-Critical)
+
+    Unix Domain Sockets (AF_UNIX, SOCK_SEQPACKET):
+
+        How it works: Provides reliable, bi-directional IPC with preserved message boundaries (unlike streaming sockets).
+
+        Benefits: Simple command/response RPC mechanism. Allows the host to easily authenticate the child process using SO_PEERCRED and pass file descriptors (memfd and eventfd) at startup.
+
+Component Overview
+Role	Mechanism	Primary Advantage
+Time-Critical Signals	eventfd	Low latency, clean integration with epoll, minimal overhead.
+Data Transfer	memfd_create + mmap	Zero-copy performance, clean security/isolation footprint.
+Non-Critical Calls	AF_UNIX (SOCK_SEQPACKET)	Reliable RPC framing, secure FD passing during setup.
+Recommended Initialization Sequence
+
+    Host Setup: Host creates a Unix socket pair (socketpair()), a shared memory descriptor (memfd_create()), and a signal descriptor (eventfd()).
+
+    Spawn Shim: Host forks and executes the child shim process, inheriting or receiving the socket descriptor.
+
+    Descriptor Exchange: Host passes the memfd and eventfd descriptors to the shim over the socket using sendmsg() with SCM_RIGHTS.
+
+    Memory Mapping: Both processes mmap() the memfd payload area.
+
+    Runtime Loop:
+
+        Host writes data to shared memory and calls write() on the eventfd to wake the child.
+
+        Child reads the eventfd, processes the shared memory data, and sends non-time-critical response messages back over the Unix socket as needed.
+
+Would you like a code example showing how to pass memfd and eventfd descriptors over a Unix socket?
+Ja
+
+Re-iterate on realtime signals.
+
+POSIX Real-Time Signals (SIGRTMIN to SIGRTMAX) are specialized Linux signals designed to overcome the fundamental limitations of standard Unix signals (SIGUSR1, SIGALRM, etc.) for time-critical, low-latency applications.
+Key Capabilities vs. Standard Signals
+
+    Guaranteed Signal Queueing: Standard Linux signals use a simple bitmask. If a host sends 10 standard signals before the child processes the first one, 9 are dropped. Real-time signals are backed by a kernel queue (RLIMIT_SIGPENDING) — every signal sent via sigqueue() is delivered.
+
+    Deterministic Delivery Ordering: Real-time signals guarantee delivery order. If multiple distinct RT signals are pending, lower signal numbers take priority (SIGRTMIN executes before SIGRTMIN+1). Multiple instances of the same RT signal are processed strictly FIFO (First In, First Out).
+
+    Payload Support: Sent using sigqueue() instead of kill(), allowing the host to pass a 4-byte/8-byte payload (union sigval containing an integer or void pointer) directly inside the signal notification.
+
+    No Predefined System Behaviors: Standard signals carry default system actions (like termination or dump core). SIGRTMIN through SIGRTMAX (typically 32 distinct signals on Linux) are strictly reserved for application-defined IPC.
+
+Reception Mechanisms in the Loaded Process
+
+To handle incoming real-time signals without running into asynchronous signal-safety issues (like forbidden heap allocations inside handlers), the loaded child process typically uses one of two patterns:
+1. Synchronous Signal Waiting (sigwaitinfo / sigtimedwait)
+
+The child process blocks all RT signals, dedicated thread loops calling sigwaitinfo(). This converts incoming asynchronous signals into synchronous event-loop notifications without triggering traditional signal handlers.
+
+    Latency: Extremely low (direct thread wake-up).
+
+    Safety: Zero async-safety issues; thread processes the payload inline inside standard code flow.
+
+2. Asynchronous Signal Handler (sigaction with SA_SIGINFO)
+
+The kernel forcibly interrupts the child thread execution to jump directly into a registered handler.
+
+    Latency: Immediate execution upon kernel delivery.
+
+    Safety: The handler must strictly execute async-signal-safe functions, or simply update atomic flags/futex state to notify a worker thread.
+
+Real-Time Signals vs. eventfd
+Feature	POSIX Real-Time Signals	eventfd
+Notification Vector	Process-wide or Thread-wide interrupt	File descriptor event
+Delivery Mechanism	Kernel signal queue	File descriptor read() or epoll
+Data Payload	Integer or Pointer (union sigval)	8-byte counter state
+Kernel Overhead	Queue allocation per signal sent	Fixed single-counter file object
+Primary Advantage	Can interrupt running user code immediately	Clean integration into select/poll/epoll event loops
+Would you like a C snippet demonstrating sigqueue() with sigwaitinfo() for low-latency delivery?
+Ja
+
+What is the latency on those signals?
+
+On standard Linux kernels running on modern hardware, POSIX Real-Time Signals typically deliver latencies between 1.5 and 4 microseconds when waking a sleeping thread via sigwaitinfo().
+Signaling Mechanism	Standard Linux	PREEMPT_RT Kernel	Main Latency Source
+Shared Memory Atomic Spin-lock	< 0.1 microseconds	< 0.1 microseconds	CPU bus interconnect (100% CPU utilization)
+Futex / Shared Condvar	0.8 – 2.5 microseconds	0.3 – 1.0 microseconds	sys_futex syscall overhead (only when sleeping)
+eventfd (write to read/epoll)	1.0 – 3.0 microseconds	0.5 – 1.5 microseconds	Syscall execution & kernel wake-up queue
+Real-Time Signal (sigqueue to sigwaitinfo)	1.5 – 4.0 microseconds	0.5 – 2.0 microseconds	Signal queue allocation & kernel dispatch
+
+Key Factors That Impact Real-Time Signal Latency
+
+    Kernel Preemption: Standard Linux kernels introduce jitter (occasionally spiking to 10+ microseconds) because kernel code sections can briefly lock out preemption. A kernel compiled with the PREEMPT_RT patchset enforces hard real-time execution with deterministic bounds.
+
+    CPU Core Affinities (sched_setaffinity): If the host and loaded child thread run on different cores, latency stays low. If they share a core, context-switching overhead adds several microseconds. Pinning threads to isolated cores using isolcpus avoids core sharing entirely.
+
+    CPU C-States / Power Management: If the receiving thread goes to sleep and the CPU core enters a deep power-saving C-state, waking the core back up can add 10 to 100+ microseconds of latency. Low-latency systems set the CPU scaling governor to performance and disable deep C-states (processor.max_cstate=1).
+
+Would you like CPU affinity and kernel tuning flags for sub-microsecond signaling?
+Ja
+
+Yes, full performance. Power efficiency is somewhat secondary...
+
+This is a PLC application
+
+To achieve sub-microsecond IPC latency for a Linux PLC application, configure kernel core isolation, real-time thread scheduling, memory locking, and CPU power management.
+
+Kernel Boot Parameters
+Add the following parameters to your kernel boot line (e.g., in /etc/default/grub under GRUB_CMDLINE_LINUX_DEFAULT):
+
+    isolcpus=2,3: Prevents the standard OS Linux scheduler from placing processes on cores 2 and 3.
+
+    nohz_full=2,3: Eliminates periodic kernel timer ticks on isolated cores whenever a single real-time thread is executing.
+
+    rcu_nocbs=2,3: Offloads Read-Copy-Update (RCU) callback processing away from isolated cores to housekeeping cores (cores 0 and 1).
+
+    processor.max_cstate=1 intel_idle.max_cstate=0: Disables power-saving C-states to keep CPU cores in active execution states continuously.
+
+    idle=poll: Forces idle execution loops to spin-poll rather than enter sleep states, removing CPU wake-up delays entirely.
+
+    nmi_watchdog=0: Disables Non-Maskable Interrupt watchdog interrupts that periodically interrupt execution.
+
+    clocksource=tsc tsc=reliable: Forces high-resolution Time Stamp Counter reads without dynamic kernel re-calibration overhead.
+
+Application Code Configuration
+Setting	Function / System Call	Purpose
+Memory Locking	mlockall(MCL_CURRENT | MCL_FUTURE)	Prevents kernel page faults by pinning all current and future virtual memory into physical RAM.
+RT Scheduling	pthread_setschedparam() with SCHED_FIFO (Priority 95–99)	Preempts all standard system threads immediately when the RT thread is runnable.
+Core Pinning	pthread_setaffinity_np()	Binds the host signaling thread to Core 2 and the loaded process/shim thread to Core 3.
+
+System & Hardware Tuning
+
+    IRQ Affinity: Exclude cores 2 and 3 from handling hardware interrupts by adjusting the bitmask in /proc/irq/default_smp_affinity (e.g., set to 3 so interrupts only target cores 0 and 1).
+
+    BIOS Settings: Disable Hyperthreading (SMT) so physical cores do not share execution units or L1/L2 caches. Set power management to "High Performance / Maximum Performance".
+
+    CPU Frequency Governor: Set the scaling governor to performance using cpupower frequency-set -g performance to prevent dynamic CPU frequency scaling latency spikes.
+
+Want a C code template implementing mlockall, SCHED_FIFO, and core affinity?
+Ja
+
+Does SIGRT exist on macOS?
+
+No, macOS does not support POSIX Real-Time Signals (SIGRTMIN through SIGRTMAX). Apple's Darwin kernel does not implement the POSIX Real-Time Signals extension (_POSIX_REALTIME_SIGNALS).
+
+Key differences on macOS compared to Linux signal architecture:
+
+    No sigqueue(): The sigqueue() system call is missing entirely, so you cannot pass signal payloads using standard POSIX signal APIs.
+
+    No Signal Queueing: macOS only supports standard BSD signals (signals 1 through 31, such as SIGUSR1 and SIGUSR2). These use simple kernel bitmasks, meaning duplicate signals sent in rapid succession are dropped if the target process hasn't handled the first one.
+
+    No Preemption Guarantees: macOS kernel scheduling does not offer hard real-time guarantees equivalent to Linux's PREEMPT_RT kernel.
+
+Recommended Low-Latency IPC Alternatives on macOS
+
+    kqueue / kevent: The native BSD event notification system (equivalent to Linux epoll). You can trigger custom low-latency user events between processes using EVFILT_USER.
+
+    Mach Ports (mach_port_t): The underlying native Darwin IPC mechanism. Mach messaging provides microsecond-level process-to-process signaling and message passing.
+
+    POSIX Shared Memory + Process-Shared Condition Variables: Combining shm_open() with pthread_cond_t (initialized with PTHREAD_PROCESS_SHARED) works on both macOS and Linux, offering sub-microsecond shared-memory notification when paired with mutexes.
+
+    Unix Domain Sockets (AF_UNIX): macOS supports standard socketpair() and Unix domain sockets, which integrate cleanly with kqueue or poll() event loops.
+
+If cross-platform support between Linux and macOS is required for your host-to-shim architecture, using shared memory with Unix sockets or kqueue/epoll abstraction wrappers provides the most reliable portability.
+Would you like a cross-platform IPC wrapper strategy that works on both Linux and macOS?
+Ja
+
+How could I best bundle this second shim in my original program? I don't want to use fork()
+
+To bundle a child shim directly inside your main host executable without creating temporary files on disk and without calling manual fork(), combine linker binary embedding, memfd_create, and posix_spawn().
+
+1. Embed the Shim Binary at Build Time
+Pack the compiled shim executable into your host binary during compilation so you ship a single executable file:
+
+    objcopy (Standard ELF Embedding): Convert the compiled shim binary into an object file linked directly into the host build:
+    Bash
+
+    objcopy -I binary -O elf64-x86-64 -B i386 shim_bin shim_embed.o
+
+    This automatically exposes auto-generated global symbols in C: extern char _binary_shim_bin_start[], _binary_shim_bin_end[], and _binary_shim_bin_size.
+
+    C23 #embed or xxd -i: Convert the binary into a static unsigned char shim_bytes[] array header file included directly in your C/C++ source.
+
+2. Create a Memory File Descriptor (memfd_create)
+To execute the shim directly from memory without saving it to /tmp or the filesystem:
+
+    Call int fd = memfd_create("shim_process", MFD_CLOEXEC);.
+
+    Write the embedded byte array (_binary_shim_bin_start) into fd.
+
+    Set execution permissions or seal the descriptor (fcntl(fd, F_ADD_SEALS, F_SEAL_SEAL | F_SEAL_WRITE)).
+
+    The executable path is now accessible via Linux's process file descriptor virtual path: /proc/self/fd/<fd>.
+
+3. Launch the Subprocess Safely (posix_spawn)
+Manual fork() in multithreaded real-time PLC hosts is dangerous because it duplicates the calling thread while leaving background thread mutexes locked in an unrecoverable state. posix_spawn() avoids manual fork management and executes cleanly via optimized clone() kernel primitives.
+
+    Pass /proc/self/fd/<fd> as the file path to posix_spawn().
+
+    Use posix_spawn_file_actions_t to map your AF_UNIX socket, eventfd, and memfd descriptors directly into the child process's file descriptor table upon creation.
+
+Stage	Mechanism	Benefit
+Storage	objcopy ELF embedding	Single binary deliverable; zero external runtime binary dependencies.
+Staging	memfd_create()	Entirely RAM-backed; diskless execution and tamper-proof.
+Execution	posix_spawn() via /proc/self/fd/N	Safe in multithreaded hosts; avoids fork() thread lock traps.
+Would you like a C code example combining memfd_create and posix_spawn with descriptor inheritance?
+Ja
+
+Or is fork() fine here, too? I just think that it might be wasteful to fork off the whole big process just for doing a shim?
+
+fork() is not as memory-wasteful as it seems because Linux uses Copy-on-Write (CoW), but for a real-time host process, it still introduces severe performance and safety drawbacks compared to posix_spawn().
+The Memory Reality: Copy-on-Write (CoW)
+
+When you call fork(), the Linux kernel does not copy the physical memory pages of the parent process. It only duplicates the parent’s page table entries and sets both processes' memory pages to read-only. Actual memory pages are only copied if either process mutates data in that memory block.
+
+If you immediately call execve() after fork(), virtually no memory is duplicated.
+Why fork() Still Hurts in a Real-Time Host
+
+Despite Copy-on-Write, using fork() to spawn a small shim process introduces three major problems:
+
+    Page Table Copy Overhead: If your host process has allocated large chunks of virtual memory (e.g., gigabytes of buffers or high memory address space), Linux must still duplicate millions of page table entries. This operation locks kernel structures and can cause latency spikes lasting several milliseconds.
+
+    Memory Overcommit Failures (ENOMEM): If your Linux system uses strict memory accounting (vm.overcommit_memory = 2, common on industrial PLCs to avoid the OOM killer), fork() temporarily doubles your process's requested virtual memory allocation. If free memory is lower than your host process's virtual size, fork() will fail with ENOMEM—even though CoW wouldn't actually consume physical RAM.
+
+    Multithreaded Deadlock Traps: In a multithreaded application, calling fork() creates a child containing only the thread that invoked fork(). Any mutexes held by background host threads at that exact microsecond will remain permanently locked in the child process. If the child attempts to call any function that acquires a lock (like malloc() or printf()) prior to exec(), it will deadlock immediately.
+
+Why posix_spawn() Solves This
+
+Under the hood on Linux, posix_spawn() bypasses standard fork() by calling vfork() or clone() with the CLONE_VM and CLONE_VFORK flags.
+
+This forces the child process to execute directly within the parent's address space without duplicating page tables or checking overcommit limits. The parent process is briefly suspended until the child completes the execve() execution call, making the spawn operation near-instantaneous and thread-safe.
+Would you like to see how to configure posix_spawn file actions to set up Unix sockets or eventfds for the shim?
+Ja
+
+Could I also fork() and immediately drop most of the stuff and "shirink" my binary down?
+
+No, calling fork() alone cannot "shrink" or replace the host binary image. While you can free heap memory or unmap data regions, the child process still retains the host's entire executable code segment (.text), symbol tables, and virtual address space.
+
+    Code Segment Retention: The kernel marks the executable code of the parent process as read-only and shares it with the child. You cannot unmap the code segment of the executable currently running the process.
+
+    Process Identity: /proc/self/exe continues to point to the large host binary on disk, meaning security scanners, system monitors, and the OS still treat the child as an instance of the host.
+
+    Memory Metadata Overhead: Even if you call free() on dynamic memory allocations or munmap() on mapped regions, the internal allocator metadata and thread descriptors created by the host remain in memory.
+
+The Only Way to Truly "Shrink": execve() / fexecve()
+
+To strip away the host process completely and reduce the footprint down to just the tiny shim executable, you must replace the process image using the exec family of system calls:
+
+    fork() or vfork() / posix_spawn(): Creates the child process shell.
+
+    execve() or fexecve(): The kernel completely wipes the existing address space—destroying the host's stack, heap, thread mappings, and code segments—and loads the lean shim binary into its place.
+
+If you use memfd_create() to hold your embedded shim binary in RAM, you can pass its file descriptor directly to fexecve(fd, argv, envp). This completely replaces the host executable with the shim in memory without touching the disk.
+Would you like a C code example of using memfd_create with fexecve to replace the child process image?
+Ja
+
+Rust: Could I somehow achieve a bundled shim program? Like build the shim as a dependency and include it in the host binary?
+
+Yes, you can build the shim automatically during compilation and embed its raw executable bytes directly into your host binary using a Cargo workspace, a build script (build.rs), and the include_bytes! macro.
+
+1. Project Workspace Setup
+
+Structure your project as a Cargo workspace with two separate packages: host and shim.
+Plaintext
+
+my_project/
+├── Cargo.toml      # Workspace manifest
+├── host/
+│   ├── Cargo.toml
+│   ├── build.rs    # Compiles the shim before host builds
+│   └── src/
+│       └── main.rs
+└── shim/
+    ├── Cargo.toml
+    └── src/
+        └── main.rs
+
+Workspace Manifest (Cargo.toml):
+Ini, TOML
+
+[workspace]
+members = ["host", "shim"]
+
+2. Automate Shim Compilation in build.rs
+
+In host/build.rs, invoke cargo to build the shim crate in release mode and place the output binary inside Cargo's OUT_DIR.
+Rust
+
+use std::env;
+use std::path::PathBuf;
+use std::process::Command;
+
+fn main() {
+    // Re-run this build script if any source in the shim package changes
+    println!("cargo:rerun-if-changed=../shim/src");
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+
+    // Build the shim binary targeting the out_dir
+    let status = Command::new(env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+        .args([
+            "build",
+            "--package",
+            "shim",
+            "--release",
+            "--target-dir",
+        ])
+        .arg(&out_dir)
+        .status()
+        .expect("Failed to execute cargo build for shim");
+
+    assert!(status.success(), "Failed to build shim binary");
+
+    // Copy or locate the resulting binary artifact
+    let shim_bin_path = out_dir.join("release").join("shim");
+    let dest_path = out_dir.join("shim_embedded");
+
+    std::fs::copy(&shim_bin_path, &dest_path)
+        .expect("Failed to copy shim binary to OUT_DIR");
+}
+
+3. Embed and Execute In-Memory in host/src/main.rs
+
+Use include_bytes! to pull the compiled shim binary directly into the host executable at compile time. Then write it to an in-memory file descriptor (memfd_create) and execute it via /proc/self/fd/N using Rust's standard Command API (which uses posix_spawn/vfork under the hood on Linux).
+Rust
+
+use std::fs::File;
+use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::process::Command;
+
+// Embed the binary compiled by build.rs into read-only memory
+static SHIM_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shim_embedded"));
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Create anonymous in-memory file descriptor
+    let memfd_name = std::ffi::CString::new("shim_process")?;
+    let raw_fd = unsafe {
+        libc::memfd_create(memfd_name.as_ptr(), libc::MFD_CLOEXEC)
+    };
+    if raw_fd < 0 {
+        return Err("memfd_create failed".into());
+    }
+
+    let mut mem_file = unsafe { File::from_raw_fd(raw_fd) };
+
+    // 2. Write embedded bytes into the memory file
+    mem_file.write_all(SHIM_BYTES)?;
+
+    // 3. Spawn child process directly from RAM via /proc/self/fd
+    let proc_path = format!("/proc/self/fd/{}", raw_fd);
+    let mut child = Command::new(proc_path)
+        .arg("--parent-pid")
+        .arg(std::process::id().to_string())
+        .spawn()?;
+
+    println!("Spawned embedded shim process (PID: {})", child.id());
+
+    // Wait or manage child process...
+    child.wait()?;
+    Ok(())
+}
+
+Would you like to see how to pass Unix sockets and eventfds to the Rust child process using std::os::unix::process::CommandExt?
+Ja
+
+Does this also work on macOS
+
+No, this specific in-memory execution technique does not work on macOS.
+
+The combination of memfd_create and /proc/self/fd/ relies on Linux-specific kernel features.
+Why It Fails on macOS
+
+    No memfd_create: macOS (Darwin kernel) does not implement the memfd_create syscall for creating anonymous in-memory files.
+
+    No /proc Filesystem: macOS does not mount a /proc pseudo-filesystem, so /proc/self/fd/N paths do not exist.
+
+    Code Signing & Hardened Runtime: macOS requires binaries to exist on disk as signed files to execute. The OS kernel actively blocks executing arbitrary memory regions directly as standalone processes.
+
+How to Handle macOS
+
+If you need cross-platform support in your Rust project, use conditional compilation (#[cfg(target_os = "...")]):
+
+    Linux: Use the in-memory memfd_create approach.
+
+    macOS: Write the embedded bytes to a temporary file (e.g., via the tempfile crate), grant execution permissions, spawn the process, and let it clean itself up when finished.
+
+Cross-Platform Rust Implementation
+Rust
+
+use std::fs::File;
+use std::io::Write;
+use std::process::{Child, Command};
+
+static SHIM_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shim_embedded"));
+
+#[cfg(target_os = "linux")]
+fn spawn_shim() -> std::io::Result<Child> {
+    use std::os::fd::AsRawFd;
+
+    let memfd_name = std::ffi::CString::new("shim_process").unwrap();
+    let raw_fd = unsafe { libc::memfd_create(memfd_name.as_ptr(), libc::MFD_CLOEXEC) };
+    if raw_fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    let mut mem_file = unsafe { File::from_raw_fd(raw_fd) };
+    mem_file.write_all(SHIM_BYTES)?;
+
+    Command::new(format!("/proc/self/fd/{}", raw_fd)).spawn()
+}
+
+#[cfg(target_os = "macos")]
+fn spawn_shim() -> std::io::Result<Child> {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Create a temporary file on macOS
+    let temp_dir = std::env::temp_dir();
+    let shim_path = temp_dir.join(format!("shim_tmp_{}", std::process::id()));
+
+    let mut file = File::create(&shim_path)?;
+    file.write_all(SHIM_BYTES)?;
+
+    // Grant execute permissions (chmod +x)
+    let mut perms = file.metadata()?.permissions();
+    perms.set_mode(0o700);
+    file.set_permissions(perms)?;
+
+    // Spawn the temporary binary
+    let child = Command::new(&shim_path).spawn();
+
+    // Clean up temporary file path from disk after spawning
+    let _ = std::fs::remove_file(shim_path);
+
+    child
+}
+
+Would you like to see how to structure the macOS side to keep the binary signed if Gatekeeper / Hardened Runtime is enabled?
+Ja

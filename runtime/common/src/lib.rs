@@ -2,6 +2,6 @@
 
 //! Shared code for all runtimes
 
-mod logging;
+pub mod logging;
 
-pub mod syscall;
+pub mod rtcall;

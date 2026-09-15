@@ -2,7 +2,7 @@ use cbindgen::{Config, Language, RenameRule};
 use std::env;
 
 fn main() {
-    let exported_symbols = ["Syscall"];
+    let exported_symbols = ["RtCall"];
 
     let manifest_dir = env::var("CARGO_MANIFEST_DIR").unwrap();
     let mut config = Config::default();
