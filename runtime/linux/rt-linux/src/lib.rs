@@ -1,4 +1,4 @@
-use std::ffi::{c_void, CStr};
+use std::ffi::{CStr, c_void};
 
 use common::rtcall::{RtCall, RtCallLogArg};
 use libloading::{Library, Symbol};
@@ -12,19 +12,35 @@ type SetupFunc<'a> = Symbol<
     ) -> u32,
 >;
 
+type CycleFunc<'a> = Symbol<'a, unsafe extern "C" fn(*mut c_void)>;
+
 pub struct Module {
     library: Library,
+    process_data: Vec<u8>,
 }
 
 impl Module {
     pub fn new(library: Library) -> Self {
-        Self { library }
+        Self {
+            library,
+            process_data: vec![0; 4],
+        }
     }
 
     pub fn setup(&mut self) {
         let func: SetupFunc = unsafe { self.library.get("__lplc_setup") }.unwrap();
 
         unsafe { func(self as *mut _ as *mut c_void, syscall_function) };
+    }
+
+    pub fn cycle(&mut self) {
+        let func: CycleFunc = unsafe { self.library.get("__lplc_cycle") }.unwrap();
+
+        unsafe { func(self.process_data.as_slice().as_ptr() as *mut c_void) }
+
+        let x = self.process_data.as_slice();
+        let data = u32::from_le_bytes([x[0], x[1], x[2], x[3]]);
+        trace!("Calling cycle function {}", data);
     }
 
     fn rtcall(&mut self, rtcall: RtCall, arg: *mut c_void) -> usize {

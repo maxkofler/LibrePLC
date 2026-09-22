@@ -1,4 +1,4 @@
-use std::env::args;
+use std::{env::args, thread::sleep, time::Duration};
 
 use libloading::Library;
 use rt_linux::Module;
@@ -17,4 +17,10 @@ fn main() {
     };
 
     module.setup();
+
+    loop {
+        module.cycle();
+
+        sleep(Duration::from_millis(1000));
+    }
 }
